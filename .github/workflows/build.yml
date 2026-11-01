@@ -23,6 +23,11 @@ jobs:
         with:
           gradle-version: 8.9
 
+      - name: Use fixed signing key
+        run: |
+          mkdir -p ~/.android
+          base64 -d keystore.b64 > ~/.android/debug.keystore
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
 
