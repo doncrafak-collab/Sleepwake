@@ -36,8 +36,12 @@ class WatchService : Service() {
         const val ACTION_START = "com.example.sleepwake.WATCH_START"
         const val ACTION_STOP = "com.example.sleepwake.WATCH_STOP"
         const val WATCH_ADDRESS = "B4:32:68:8D:16:7A"
-        private val SERVICE_UUID = UUID.fromString("c2e6ffb0-e966-1000-8000-bef9c223df6a")
-        private val CHAR_UUID = UUID.fromString("c2e6ffb6-e966-1000-8000-bef9c223df6a")
+        private const val BASE = "-e966-1000-8000-bef9c223df6a"
+        private val SERVICE_UUID = UUID.fromString("c2e6ffb0$BASE")
+        private val AT_WRITE = UUID.fromString("c2e6ffb3$BASE")
+        private val AT_NOTIFY = UUID.fromString("c2e6ffb4$BASE")
+        private val FM_NOTIFY = UUID.fromString("c2e6ffb6$BASE")
+        private val BIN_NOTIFY = UUID.fromString("c2e6ffb2$BASE")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val CHANNEL = "watch"
 
@@ -46,7 +50,12 @@ class WatchService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var gatt: BluetoothGatt? = null
+    private var atWrite: BluetoothGattCharacteristic? = null
     private var stopping = false
+    private var handshakeDone = false
+    private val cccdQueue = ArrayDeque<BluetoothGattCharacteristic>()
+    private val atQueue = ArrayDeque<String>()
+    private var atTimeout: Runnable? = null
     private val timeFmt = SimpleDateFormat("d.M. HH:mm:ss", Locale.getDefault())
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -57,7 +66,7 @@ class WatchService : Service() {
                 stopping = false
                 goForeground()
                 Scheduler.prefs(this).edit().putBoolean("watchOn", true).apply()
-                log("Spouštím záznam z hodinek")
+                log("Spouštím záznam z hodinek (verze 2)")
                 connect()
             }
             else -> {
@@ -101,6 +110,10 @@ class WatchService : Service() {
     }
 
     private fun closeGatt() {
+        atTimeout?.let { handler.removeCallbacks(it) }
+        cccdQueue.clear()
+        atQueue.clear()
+        handshakeDone = false
         try {
             gatt?.disconnect()
         } catch (e: Exception) {
@@ -135,21 +148,7 @@ class WatchService : Service() {
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            val ch = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
-            if (ch == null) {
-                log("Kanál ffb6 nenalezen (status $status)")
-                return
-            }
-            g.setCharacteristicNotification(ch, true)
-            val d = ch.getDescriptor(CCCD_UUID)
-            if (d == null) {
-                log("Descriptor 2902 nenalezen")
-                return
-            }
-            @Suppress("DEPRECATION")
-            d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            @Suppress("DEPRECATION")
-            g.writeDescriptor(d)
+            handler.post { setupNotifications(g, status) }
         }
 
         override fun onDescriptorWrite(
@@ -157,7 +156,10 @@ class WatchService : Service() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            log("Odběr tepu zapnut (status $status)")
+            handler.post {
+                log("Odběr ${descriptor.characteristic.uuid.toString().substring(0, 8)} (status $status)")
+                nextCccd(g)
+            }
         }
 
         // Android 13 a novější
@@ -166,19 +168,115 @@ class WatchService : Service() {
             ch: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            handleFrame(value)
+            val copy = value.copyOf()
+            handler.post { onNotify(ch.uuid, copy) }
         }
 
         // starší Android
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            if (Build.VERSION.SDK_INT < 33) handleFrame(ch.value)
+            if (Build.VERSION.SDK_INT < 33) {
+                val copy = ch.value?.copyOf() ?: return
+                handler.post { onNotify(ch.uuid, copy) }
+            }
         }
     }
 
-    // ---------- zpracování zpráv "FM" ----------
-    private fun handleFrame(b: ByteArray?) {
-        if (b == null) return
+    // ---------- zapnutí odběrů ----------
+    private fun setupNotifications(g: BluetoothGatt, status: Int) {
+        val svc = g.getService(SERVICE_UUID)
+        if (svc == null) {
+            log("Služba ffb0 nenalezena (status $status)")
+            return
+        }
+        atWrite = svc.getCharacteristic(AT_WRITE)
+        cccdQueue.clear()
+        for (u in listOf(AT_NOTIFY, FM_NOTIFY, BIN_NOTIFY)) {
+            val c = svc.getCharacteristic(u)
+            if (c != null) {
+                g.setCharacteristicNotification(c, true)
+                cccdQueue.add(c)
+            } else {
+                log("Chybí kanál $u")
+            }
+        }
+        nextCccd(g)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun nextCccd(g: BluetoothGatt) {
+        val c = cccdQueue.removeFirstOrNull()
+        if (c == null) {
+            log("Všechny odběry zapnuty, posílám handshake")
+            startHandshake()
+            return
+        }
+        val d = c.getDescriptor(CCCD_UUID)
+        if (d == null) {
+            log("Kanál bez descriptoru 2902")
+            nextCccd(g)
+            return
+        }
+        d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        g.writeDescriptor(d)
+    }
+
+    // ---------- handshake (textové AT příkazy) ----------
+    private fun startHandshake() {
+        handshakeDone = false
+        atQueue.clear()
+        atQueue.addAll(listOf("AT+SPS:AND", "AT+GST?", "AT+GBK?"))
+        sendNextAt()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun sendNextAt() {
+        atTimeout?.let { handler.removeCallbacks(it) }
+        val cmd = atQueue.removeFirstOrNull()
+        if (cmd == null) {
+            if (!handshakeDone) {
+                handshakeDone = true
+                log("Handshake hotov, čekám na tep")
+            }
+            return
+        }
+        val w = atWrite
+        if (w == null) {
+            log("Kanál pro příkazy (ffb3) nenalezen")
+            return
+        }
+        log("AT -> $cmd")
+        w.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        w.value = (cmd + "\u0000").toByteArray()
+        gatt?.writeCharacteristic(w)
+        val r = Runnable {
+            log("Bez odpovědi na $cmd")
+            sendNextAt()
+        }
+        atTimeout = r
+        handler.postDelayed(r, 2000)
+    }
+
+    private fun onAt(s: String) {
+        log("AT <- $s")
+        if (s.startsWith("AT+GBK:")) {
+            val key = s.substringAfter("AT+GBK:").trim()
+            atQueue.addFirst("AT+CCS:0")
+            atQueue.addFirst("AT+BDQ:2673,$key")
+        }
+        if (!handshakeDone) handler.postDelayed({ sendNextAt() }, 100)
+    }
+
+    // ---------- příchozí data ----------
+    private fun onNotify(uuid: UUID, b: ByteArray) {
+        when (uuid) {
+            AT_NOTIFY -> onAt(String(b).trimEnd('\u0000'))
+            FM_NOTIFY -> handleFrame(b)
+            else -> log("Binární odpověď: " + b.joinToString("") { "%02x".format(it) })
+        }
+    }
+
+    private fun handleFrame(b: ByteArray) {
         if (b.size < 20 || b[0] != 'F'.code.toByte() || b[1] != 'M'.code.toByte()) {
             log("Jiná zpráva: " + b.joinToString("") { "%02x".format(it) })
             return
